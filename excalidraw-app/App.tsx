@@ -35,6 +35,7 @@ import {
 } from "@excalidraw/common";
 import polyfill from "@excalidraw/excalidraw/polyfill";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { loadFromBlob } from "@excalidraw/excalidraw/data/blob";
 import { t } from "@excalidraw/excalidraw/i18n";
 
@@ -147,6 +148,21 @@ import "./index.scss";
 
 import { ExcalidrawPlusPromoBanner } from "./components/ExcalidrawPlusPromoBanner";
 import { AppSidebar } from "./components/AppSidebar";
+import { AuthDialog } from "./components/AuthDialog";
+import { DrawingsManagerDialog } from "./components/DrawingsManagerDialog";
+
+import {
+  userAtom,
+  currentDrawingIdAtom,
+  currentDrawingNameAtom,
+  cloudSyncStatusAtom,
+  commentsAtom,
+  commentModeAtom,
+  pendingCommentPosAtom,
+  authDialogOpenAtom,
+  drawingsManagerOpenAtom,
+} from "./cloud-jotai";
+import { supabase, saveDrawing, updateDrawing } from "./data/supabase";
 
 import type { CollabAPI } from "./collab/Collab";
 
@@ -383,6 +399,19 @@ const ExcalidrawWrapper = () => {
 
   const editorInterface = useEditorInterface();
 
+  // Cloud sync state
+  const [user, setUser] = useAtom(userAtom);
+  const [currentDrawingId, setCurrentDrawingId] = useAtom(currentDrawingIdAtom);
+  const [currentDrawingName, setCurrentDrawingName] = useAtom(currentDrawingNameAtom);
+  const [cloudSyncStatus, setCloudSyncStatus] = useAtom(cloudSyncStatusAtom);
+  const [comments] = useAtom(commentsAtom);
+  const [commentMode, setCommentMode] = useAtom(commentModeAtom);
+  const [, setPendingCommentPos] = useAtom(pendingCommentPosAtom);
+  const [, setAuthDialogOpen] = useAtom(authDialogOpenAtom);
+  const [, setDrawingsManagerOpen] = useAtom(drawingsManagerOpenAtom);
+  const [latestAppState, setLatestAppState] = useState<AppState | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
   // initial state
   // ---------------------------------------------------------------------------
 
@@ -417,6 +446,65 @@ const ExcalidrawWrapper = () => {
     // TODO maybe remove this in several months (shipped: 24-03-11)
     migrationAdapter: LibraryLocalStorageMigrationAdapter,
   });
+
+  // Auth state initialisation
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null);
+    });
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => subscription.unsubscribe();
+  }, [setUser]);
+
+  // Debounced cloud save (3-second debounce after last change)
+  const debouncedCloudSaveRef = useRef(
+    debounce(
+      async (
+        id: string,
+        els: readonly OrderedExcalidrawElement[],
+        state: AppState,
+        fls: BinaryFiles,
+        setStatus: (s: "idle" | "saving" | "saved" | "error") => void,
+      ) => {
+        setStatus("saving");
+        try {
+          await updateDrawing(id, els, state, fls);
+          setStatus("saved");
+        } catch {
+          setStatus("error");
+        }
+      },
+      3000,
+    ),
+  );
+
+  const handleSaveNewDrawing = useCallback(async () => {
+    if (!excalidrawAPI) {
+      return;
+    }
+    setCloudSyncStatus("saving");
+    try {
+      const els = excalidrawAPI.getSceneElements();
+      const state = excalidrawAPI.getAppState();
+      const fls = excalidrawAPI.getFiles();
+      const name = excalidrawAPI.getName() || "Untitled";
+      const drawing = await saveDrawing(name, els, state, fls);
+      setCurrentDrawingId(drawing.id);
+      setCurrentDrawingName(drawing.name);
+      setCloudSyncStatus("saved");
+    } catch {
+      setCloudSyncStatus("error");
+    }
+  }, [
+    excalidrawAPI,
+    setCloudSyncStatus,
+    setCurrentDrawingId,
+    setCurrentDrawingName,
+  ]);
 
   const [, forceRefresh] = useState(false);
 
@@ -680,6 +768,9 @@ const ExcalidrawWrapper = () => {
     appState: AppState,
     files: BinaryFiles,
   ) => {
+    // Track latest appState for comment pin positioning
+    setLatestAppState(appState);
+
     if (collabAPI?.isCollaborating()) {
       collabAPI.syncElements(elements);
     }
@@ -714,6 +805,17 @@ const ExcalidrawWrapper = () => {
           }
         }
       });
+    }
+
+    // Cloud auto-save
+    if (user && currentDrawingId) {
+      debouncedCloudSaveRef.current(
+        currentDrawingId,
+        elements,
+        appState,
+        files,
+        setCloudSyncStatus,
+      );
     }
 
     // Render the debug scene if the debug canvas is available
@@ -903,7 +1005,8 @@ const ExcalidrawWrapper = () => {
 
   return (
     <div
-      style={{ height: "100%" }}
+      ref={containerRef}
+      style={{ height: "100%", position: "relative" }}
       className={clsx("excalidraw-app", {
         "is-collaborating": isCollaborating,
       })}
@@ -953,12 +1056,90 @@ const ExcalidrawWrapper = () => {
         autoFocus={true}
         theme={editorTheme}
         renderTopRightUI={(isMobile) => {
-          if (isMobile || !collabAPI || isCollabDisabled) {
+          if (isMobile) {
             return null;
+          }
+
+          const syncLabel =
+            cloudSyncStatus === "saving"
+              ? "Saving…"
+              : cloudSyncStatus === "saved"
+                ? "Saved ✓"
+                : cloudSyncStatus === "error"
+                  ? "Sync error"
+                  : "";
+
+          const btnStyle: CSSProperties = {
+            padding: "4px 10px",
+            background: "var(--island-bg-color)",
+            border: "1px solid var(--button-gray-2)",
+            borderRadius: "4px",
+            cursor: "pointer",
+            fontSize: "13px",
+            color: "var(--text-primary-color)",
+          };
+          const primaryBtnStyle: CSSProperties = {
+            ...btnStyle,
+            background: "var(--color-primary)",
+            color: "#fff",
+            border: "none",
+          };
+
+          const cloudUI = (
+            <div
+              style={{ display: "flex", alignItems: "center", gap: "6px" }}
+            >
+              {user ? (
+                <>
+                  {syncLabel && (
+                    <span
+                      style={{ fontSize: "12px", opacity: 0.7, color: "var(--text-primary-color)" }}
+                    >
+                      {syncLabel}
+                    </span>
+                  )}
+                  {!currentDrawingId && (
+                    <button style={primaryBtnStyle} onClick={handleSaveNewDrawing}>
+                      Save to cloud
+                    </button>
+                  )}
+                  <button
+                    style={btnStyle}
+                    onClick={() => setDrawingsManagerOpen(true)}
+                  >
+                    My Drawings
+                  </button>
+                  <button
+                    style={btnStyle}
+                    onClick={() =>
+                      supabase.auth.signOut().then(() => {
+                        setUser(null);
+                        setCurrentDrawingId(null);
+                        setCloudSyncStatus("idle");
+                      })
+                    }
+                  >
+                    Sign out
+                  </button>
+                </>
+              ) : (
+                <button
+                  style={primaryBtnStyle}
+                  onClick={() => setAuthDialogOpen(true)}
+                >
+                  Sign in
+                </button>
+              )}
+            </div>
+          );
+
+          if (!collabAPI || isCollabDisabled) {
+            return cloudUI;
           }
 
           return (
             <div className="excalidraw-ui-top-right">
+              {cloudUI}
               {excalidrawAPI?.getEditorInterface().formFactor === "desktop" && (
                 <ExcalidrawPlusPromoBanner
                   isSignedIn={isExcalidrawPlusSignedUser}
@@ -1058,6 +1239,10 @@ const ExcalidrawWrapper = () => {
         />
 
         <AppSidebar />
+        <AuthDialog />
+        {excalidrawAPI && (
+          <DrawingsManagerDialog excalidrawAPI={excalidrawAPI} />
+        )}
 
         {errorMessage && (
           <ErrorDialog onClose={() => setErrorMessage("")}>
@@ -1262,6 +1447,90 @@ const ExcalidrawWrapper = () => {
           />
         )}
       </Excalidraw>
+
+      {/* Comment pins overlay */}
+      {latestAppState && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            pointerEvents: commentMode ? "auto" : "none",
+            cursor: commentMode ? "crosshair" : "default",
+            zIndex: commentMode ? 100 : 10,
+          }}
+          onClick={
+            commentMode
+              ? (e) => {
+                  const rect =
+                    containerRef.current?.getBoundingClientRect();
+                  if (!rect) {
+                    return;
+                  }
+                  const zoom = latestAppState.zoom.value;
+                  const sceneX =
+                    (e.clientX - rect.left - latestAppState.scrollX) / zoom;
+                  const sceneY =
+                    (e.clientY - rect.top - latestAppState.scrollY) / zoom;
+                  setPendingCommentPos({ x: sceneX, y: sceneY });
+                  setCommentMode(false);
+                  excalidrawAPI?.updateScene({
+                    appState: {
+                      openSidebar: { name: "default", tab: "comments" },
+                    },
+                    captureUpdate: CaptureUpdateAction.NEVER,
+                  });
+                }
+              : undefined
+          }
+        >
+          {comments
+            .filter((c) => !c.resolved && c.x != null && c.y != null)
+            .map((c) => {
+              const zoom = latestAppState.zoom.value;
+              const left = c.x! * zoom + latestAppState.scrollX;
+              const top = c.y! * zoom + latestAppState.scrollY;
+              return (
+                <button
+                  key={c.id}
+                  title={c.content}
+                  style={{
+                    position: "absolute",
+                    left,
+                    top,
+                    transform: "translate(-50%, -100%)",
+                    background: "var(--color-primary)",
+                    color: "#fff",
+                    border: "none",
+                    borderRadius: "50% 50% 50% 0",
+                    width: "28px",
+                    height: "28px",
+                    cursor: "pointer",
+                    fontSize: "14px",
+                    pointerEvents: "auto",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    boxShadow: "0 2px 4px rgba(0,0,0,0.2)",
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    excalidrawAPI?.updateScene({
+                      appState: {
+                        openSidebar: {
+                          name: "default",
+                          tab: "comments",
+                        },
+                      },
+                      captureUpdate: CaptureUpdateAction.NEVER,
+                    });
+                  }}
+                >
+                  💬
+                </button>
+              );
+            })}
+        </div>
+      )}
     </div>
   );
 };
